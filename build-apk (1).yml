@@ -1,0 +1,68 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Найти проект (подходит и ChessOverlay.zip, загруженный в корень репозитория)
+        run: |
+          if [ -f ChessOverlay.zip ]; then mkdir -p _src && unzip -q -o ChessOverlay.zip -d _src; fi
+          S=$(find . -name settings.gradle -not -path './.git/*' | head -1)
+          [ -n "$S" ] || { echo "settings.gradle не найден"; exit 1; }
+          echo "ROOT=$(cd "$(dirname "$S")" && pwd)" >> "$GITHUB_ENV"
+
+      - name: Установить Gradle 8.7
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d "$HOME"
+          echo "$HOME/gradle-8.7/bin" >> "$GITHUB_PATH"
+
+      - name: Stockfish для Android arm64 (скачать готовый или собрать; иначе приложение работает на встроенном движке)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          DEST="$ROOT/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/official-stockfish/Stockfish/releases/latest | python3 -c "import sys,json; a=json.load(sys.stdin).get('assets',[]); u=[x['browser_download_url'] for x in a if 'android-armv8' in x['name'] and 'dotprod' not in x['name'] and x['name'].endswith('.tar')]; print(u[0] if u else '')") || URL=""
+          if [ -n "$URL" ]; then
+            echo "Скачиваю готовую сборку: $URL"
+            mkdir -p /tmp/sfdl && curl -fsSL "$URL" -o /tmp/sfdl/sf.tar && tar -xf /tmp/sfdl/sf.tar -C /tmp/sfdl
+            BIN=$(find /tmp/sfdl -type f -name 'stockfish*' ! -name '*.tar' ! -name '*.md' ! -name '*.txt' | head -1)
+            if [ -n "$BIN" ] && [ "$(head -c 4 "$BIN" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then cp "$BIN" "$DEST/libstockfish.so"; echo "готовый бинарник установлен"; fi
+          fi
+          if [ ! -f "$DEST/libstockfish.so" ]; then
+            echo "Собираю Stockfish из исходников"
+            TAG=$(git ls-remote --tags --refs https://github.com/official-stockfish/Stockfish.git 'sf_*' | sed 's#.*refs/tags/##' | grep -E '^sf_[0-9]+(\.[0-9]+)?$' | sort -V | tail -1)
+            git clone --depth 1 --branch "$TAG" https://github.com/official-stockfish/Stockfish.git /tmp/sf
+            NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$ANDROID_NDK_LATEST_HOME}}"
+            export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+            cd /tmp/sf/src
+            make -j"$(nproc)" build ARCH=armv8 COMP=ndk
+            cp stockfish "$DEST/libstockfish.so"
+          fi
+          ls -la "$DEST"
+
+      - name: Собрать APK
+        working-directory: ${{ env.ROOT }}
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          gradle --no-daemon assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChessOverlay-apk
+          path: ${{ env.ROOT }}/app/build/outputs/apk/debug/app-debug.apk
